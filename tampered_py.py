@@ -6,7 +6,7 @@ import time
 import os
 import threading
 import socket
-from flask import Flask, Response, render_template_string, send_file
+from flask import Flask, Response, render_template_string, send_file, request
 
 # === Config ===
 OUTPUT_VIDEO = "captured_stream.avi"
@@ -14,6 +14,7 @@ DEFAULT_DURATION = 30
 DEFAULT_PORT = 5000
 TAMPER_EVERY_N_FRAMES = 5
 SHOW_VISUAL_TAMPER_MARKER = True
+TARGET_FPS = 20  # Target frames per second for video writer
 
 # === Global Variables ===
 frame_lock = threading.Lock()
@@ -24,6 +25,9 @@ tampered_frames = []  # Track which frames were tampered
 frame_id = 0
 duration = DEFAULT_DURATION
 start_time = 0
+is_recording = False
+cap = None
+out = None
 
 app = Flask(__name__)
 
@@ -69,7 +73,10 @@ def home():
             <h1>Live Stream Authentication</h1>
             <div><a href="/video">View Stream</a></div>
             <div>
-                <button onclick="startRecording()">Start Recording</button>
+                <form action="/start_recording" method="post">
+                    Duration (seconds): <input type="number" name="duration" value="''' + str(DEFAULT_DURATION) + '''" min="1" max="300">
+                    <button type="submit">Start Recording</button>
+                </form>
                 <button onclick="downloadSHA('input')">Input SHA</button>
                 <button onclick="downloadSHA('output')">Output SHA</button>
                 <button onclick="downloadVideo()">Download Video</button>
@@ -79,12 +86,16 @@ def home():
             <div>Frame Count: <span id="frame-count">0</span></div>
             <div>Tampered: <span id="tampered" style="color:green">No</span></div>
             <div>Tampered Frames: <span id="tampered-frames">None</span></div>
+            <div>Recording: <span id="recording-status">No</span></div>
+            <div>Elapsed: <span id="elapsed-time">0</span>s</div>
             <script>
                 function update() {
                     fetch('/get_sha_logs').then(r => r.json()).then(data => {
                         document.getElementById('input-sha').textContent = data.input_sha;
                         document.getElementById('output-sha').textContent = data.output_sha;
                         document.getElementById('frame-count').textContent = data.frame_count;
+                        document.getElementById('recording-status').textContent = data.is_recording ? "Yes" : "No";
+                        document.getElementById('elapsed-time').textContent = data.elapsed_time;
                         const tamperedElem = document.getElementById('tampered');
                         if (data.input_sha !== data.output_sha && data.output_sha !== '-') {
                             tamperedElem.textContent = 'YES';
@@ -97,7 +108,6 @@ def home():
                             data.tampered_frames.length ? data.tampered_frames.join(', ') : 'None';
                     });
                 }
-                function startRecording() { fetch('/start_recording', {method: 'POST'}); }
                 function downloadSHA(type) { window.location = '/download_sha_' + type; }
                 function downloadVideo() { window.location = '/download_video'; }
                 setInterval(update, 500);
@@ -118,14 +128,31 @@ def video_feed():
 
 @app.route('/start_recording', methods=['POST'])
 def start_recording():
-    threading.Thread(target=record_stream).start()
-    return {"message": f"Recording started for {DEFAULT_DURATION} seconds"}, 200
+    global duration, start_time
+    try:
+        duration = int(request.form.get('duration', DEFAULT_DURATION))
+        if duration <= 0:
+            duration = DEFAULT_DURATION
+    except ValueError:
+        duration = DEFAULT_DURATION
+    
+    if not is_recording:
+        threading.Thread(target=record_stream).start()
+        return {"message": f"Recording started for {duration} seconds"}, 200
+    else:
+        return {"message": "Recording already in progress"}, 400
 
 def record_stream():
-    global stream_frame, frame_id, input_sha_log, output_sha_log, tampered_frames
+    global stream_frame, frame_id, input_sha_log, output_sha_log, tampered_frames, is_recording, cap, out, start_time, duration
     
+    is_recording = True
     cap = cv2.VideoCapture(0)
     width, height = 640, 480
+    
+    # Set up video writer with fixed FPS
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, TARGET_FPS, (width, height))
+    
     if not cap.isOpened():
         print("No camera - using test pattern")
         test_pattern = np.zeros((height, width, 3), dtype=np.uint8)
@@ -138,12 +165,16 @@ def record_stream():
             height, width = frame.shape[:2]
     
     start_time = time.time()
+    end_time = start_time + duration
     tampered_frames = []
     input_sha_log = {}
     output_sha_log = {}
     frame_id = 0
     
-    while time.time() - start_time < DEFAULT_DURATION:
+    # Main recording loop with precise timing
+    while time.time() < end_time:
+        frame_start_time = time.time()
+        
         if cap.isOpened():
             ret, frame = cap.read()
             if not ret: break
@@ -177,15 +208,31 @@ def record_stream():
             cv2.putText(output_frame, f"TAMPERED", (width-200, 50), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
         
+        # Write frame to video file
+        out.write(output_frame)
+        
         with frame_lock:
             stream_frame = output_frame.copy()
         
         frame_id += 1
-        time.sleep(0.05)
+        
+        # Calculate time to sleep to maintain frame rate
+        processing_time = time.time() - frame_start_time
+        target_frame_time = 1.0 / TARGET_FPS
+        if processing_time < target_frame_time:
+            time.sleep(target_frame_time - processing_time)
     
+    # Ensure we capture the full duration
+    while time.time() < end_time:
+        out.write(output_frame)  # Write the last frame to fill remaining time
+        time.sleep(0.01)
+    
+    # Clean up
     if cap.isOpened():
         cap.release()
+    out.release()
     save_recording()
+    is_recording = False
 
 def save_recording():
     try:
@@ -200,11 +247,14 @@ def save_recording():
 @app.route('/get_sha_logs')
 def get_sha_logs():
     latest_frame = max(input_sha_log.keys()) if input_sha_log else 0
+    elapsed = time.time() - start_time if is_recording and start_time > 0 else 0
     return {
         "input_sha": input_sha_log.get(latest_frame, {}).get("sha256", "-"),
         "output_sha": output_sha_log.get(latest_frame, {}).get("sha256", "-"),
         "frame_count": latest_frame,
-        "tampered_frames": tampered_frames
+        "tampered_frames": tampered_frames,
+        "is_recording": is_recording,
+        "elapsed_time": round(elapsed, 1)
     }
 
 @app.route('/download_sha_input')
