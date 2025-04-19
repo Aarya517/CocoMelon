@@ -22,21 +22,25 @@ def compute_sha256(data):
     return hash_object.hexdigest()
 
 def compute_cryptograph_for_frame(frame, grid_size=GRID_SIZE):
-    h, w, _ = frame.shape
-    grid_h, grid_w = h // grid_size, w // grid_size
-    cryptographs = []
-    for gy in range(grid_size):
-        for gx in range(grid_size):
-            grid = frame[gy*grid_h:(gy+1)*grid_h, gx*grid_w:(gx+1)*grid_w]
-            mean_pixel = np.mean(grid, axis=(0, 1))
-            value = int(np.sum(mean_pixel))
-            cryptograph = 0
-            if value % 3 == 0 and value % 11 == 0:
-                cryptograph += value
-            if value % 5 == 0:
-                cryptograph *= 5
-            cryptographs.append(cryptograph)
-    return cryptographs
+    try:
+        h, w, _ = frame.shape
+        grid_h, grid_w = h // grid_size, w // grid_size
+        frame_cryptographs = []
+
+        for gy in range(grid_size):
+            for gx in range(grid_size):
+                start_y = gy * grid_h
+                start_x = gx * grid_w
+                grid = frame[start_y:start_y + grid_h, start_x:start_x + grid_w]
+                mean_pixel = np.mean(grid, axis=(0, 1))
+                value = int(np.sum(mean_pixel))
+                cryptograph = value
+
+                frame_cryptographs.append(cryptograph)
+        return frame_cryptographs
+    except Exception as e:
+        print(f"Error computing cryptograph: {e}")
+        return []
 
 # === SHA Extraction from PNGs ===
 def extract_and_log_sha_from_images(folder_path, output_json):
@@ -56,8 +60,8 @@ def extract_and_log_sha_from_images(folder_path, output_json):
     with open(output_json, 'w') as f:
         json.dump(log, f, indent=4)
     combined_sha = compute_sha256(combined)
-    print(f"[\u2713] SHA log written to {output_json}")
-    print(f"[\u2713] Combined SHA: {combined_sha}")
+    print(f"[✓] SHA log written to {output_json}")
+    print(f"[✓] Combined SHA: {combined_sha}")
     return combined_sha
 
 # === Flask Setup ===
@@ -161,7 +165,7 @@ def save_frames_and_sha(frames):
         cv2.imwrite(os.path.join(FRAME_DIR, f"frame_{idx:04d}.png"), f)
     with open(INPUT_SHA_LOG, 'w') as f:
         json.dump(sha_log, f, indent=4)
-    print(f"[\u2713] Frames saved to {FRAME_DIR}")
+    print(f"[✓] Frames saved to {FRAME_DIR}")
     reconstruct_video_from_frames()
     global output_combined_sha
     output_combined_sha = extract_and_log_sha_from_images(FRAME_DIR, OUTPUT_SHA_LOG)
@@ -179,7 +183,7 @@ def reconstruct_video_from_frames():
         if frame is not None:
             out.write(frame)
     out.release()
-    print(f"[\u2713] Reconstructed video saved to {OUTPUT_VIDEO_PATH}")
+    print(f"[✓] Reconstructed video saved to {OUTPUT_VIDEO_PATH}")
 
 @app.route('/download_video')
 def download_video():
